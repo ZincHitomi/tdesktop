@@ -865,7 +865,9 @@ QSize Message::performCountOptimalSize() {
 
 void Message::refreshTopicButton() {
 	const auto item = data();
-	if (isAttachedToPrevious() || context() != Context::History) {
+	if (isAttachedToPrevious()
+			|| (context() != Context::History)
+			|| item->isScheduled()) {
 		_topicButton = nullptr;
 	} else if (const auto topic = item->topic()) {
 		if (!_topicButton) {
@@ -2067,6 +2069,7 @@ bool Message::hasFromPhoto() const {
 		return !item->out() && !item->history()->peer->isUser();
 	} break;
 	case Context::ContactPreview:
+	case Context::ShortcutMessages:
 		return false;
 	}
 	Unexpected("Context in Message::hasFromPhoto.");
@@ -3036,7 +3039,7 @@ void Message::refreshReactions() {
 							= ExtractController(context)) {
 							ShowPremiumPreviewBox(
 								controller,
-								PremiumPreview::TagsForMessages);
+								PremiumFeature::TagsForMessages);
 						}
 						return;
 					}
@@ -3274,6 +3277,7 @@ bool Message::hasFromName() const {
 		return false;
 	} break;
 	case Context::ContactPreview:
+	case Context::ShortcutMessages:
 		return false;
 	}
 	Unexpected("Context in Message::hasFromName.");
@@ -3312,6 +3316,9 @@ bool Message::hasOutLayout() const {
 	const auto item = data();
 	if (item->history()->peer->isSelf()) {
 		if (const auto forwarded = item->Get<HistoryMessageForwarded>()) {
+			if (context() == Context::ShortcutMessages) {
+				return true;
+			}
 			return (context() == Context::SavedSublist)
 				&& (!forwarded->forwardOfForward()
 					? (forwarded->originalSender
