@@ -13,11 +13,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "iv/iv_instance.h"
 #include "core/click_handler_types.h"
 #include "core/ui_integration.h"
+#include "data/components/sponsored_messages.h"
 #include "data/stickers/data_custom_emoji.h"
 #include "data/data_file_click_handler.h"
 #include "data/data_photo_media.h"
 #include "data/data_session.h"
-#include "data/data_sponsored_messages.h"
 #include "data/data_web_page.h"
 #include "history/history.h"
 #include "history/history_item_components.h"
@@ -27,6 +27,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/view/media/history_view_media_common.h"
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
+#include "menu/menu_sponsored.h"
 #include "ui/chat/chat_style.h"
 #include "ui/painter.h"
 #include "ui/rect.h"
@@ -127,11 +128,20 @@ constexpr auto kMaxOriginalEntryLines = 8192;
 		if (const auto controller = my.sessionWindow.get()) {
 			if (const auto iv = webpage->iv.get()) {
 				const auto hash = ExtractHash(webpage, text);
-				Core::App().iv().show(controller->uiShow(), iv, hash);
+				Core::App().iv().show(controller, iv, hash);
 				return;
 			} else {
 				HiddenUrlClickHandler::Open(webpage->url, context.other);
 			}
+		}
+	});
+}
+
+[[nodiscard]] ClickHandlerPtr AboutSponsoredClickHandler() {
+	return std::make_shared<LambdaClickHandler>([=](ClickContext context) {
+		const auto my = context.other.value<ClickHandlerContext>();
+		if (const auto controller = my.sessionWindow.get()) {
+			Menu::ShowSponsoredAbout(controller->uiShow());
 		}
 	});
 }
@@ -217,12 +227,13 @@ WebPage::WebPage(
 	if (!(flags & MediaWebPageFlag::Sponsored)) {
 		return std::nullopt;
 	}
-	const auto &data = _parent->data()->history()->owner();
-	const auto details = data.sponsoredMessages().lookupDetails(
+	const auto &session = _parent->data()->history()->session();
+	const auto details = session.sponsoredMessages().lookupDetails(
 		_parent->data()->fullId());
 	auto result = std::make_optional<SponsoredData>();
 	result->buttonText = details.buttonText;
 	result->hasExternalLink = (details.externalLink == _data->url);
+	result->canReport = details.canReport;
 #ifdef _DEBUG
 	if (details.peer) {
 #else
@@ -248,7 +259,7 @@ QSize WebPage::countOptimalSize() {
 
 	// Detect _openButtonWidth before counting paddings.
 	_openButton = Ui::Text::String();
-/*	if (HasButton(_data)) {
+	if ((_data->iv != nullptr || _data->siteName == "Ad") && HasButton(_data)) {
 		const auto context = Core::MarkedTextContext{
 			.session = &_data->session(),
 			.customEmojiRepaint = [] {},
@@ -259,8 +270,7 @@ QSize WebPage::countOptimalSize() {
 			PageToPhrase(_data),
 			kMarkupTextOptions,
 			context);
-	} else */
-	if (_sponsoredData) {
+	} else if (_sponsoredData) {
 		if (!_sponsoredData->buttonText.isEmpty()) {
 			_openButton.setText(
 				st::semiboldTextStyle,
@@ -338,6 +348,10 @@ QSize WebPage::countOptimalSize() {
 			_openl = SponsoredLink(_sponsoredData->hasExternalLink
 				? _data->url
 				: QString());
+
+			if (_sponsoredData->canReport) {
+				_sponsoredData->hintLink = AboutSponsoredClickHandler();
+			}
 		}
 	}
 
@@ -480,6 +494,16 @@ QSize WebPage::countOptimalSize() {
 
 	if (_asArticle) {
 		minHeight = resizeGetHeight(maxWidth);
+	}
+	if (_sponsoredData && _sponsoredData->canReport) {
+		_sponsoredData->widthBeforeHint
+			= st::webPageTitleStyle.font->width(siteName);
+		const auto &font = st::webPageSponsoredHintFont;
+		_sponsoredData->hintSize = QSize(
+			font->width(tr::lng_sponsored_message_revenue_button(tr::now))
+				+ font->height,
+			font->height);
+		maxWidth += _sponsoredData->hintSize.width();
 	}
 	return { maxWidth, minHeight };
 }
@@ -791,6 +815,50 @@ void WebPage::draw(Painter &p, const PaintContext &context) const {
 			endskip,
 			false,
 			context.selection);
+		if (asSponsored
+			&& _sponsoredData->canReport
+			&& (paintw >
+					_sponsoredData->widthBeforeHint
+						+ _sponsoredData->hintSize.width())) {
+			if (_sponsoredData->hintRipple) {
+				_sponsoredData->hintRipple->paint(
+					p,
+					_sponsoredData->lastHintPos.x(),
+					_sponsoredData->lastHintPos.y(),
+					width(),
+					&cache->bg);
+				if (_sponsoredData->hintRipple->empty()) {
+					_sponsoredData->hintRipple = nullptr;
+				}
+			}
+
+			auto color = cache->icon;
+			color.setAlphaF(color.alphaF() * 0.15);
+
+			const auto height = st::webPageSponsoredHintFont->height;
+			const auto radius = height / 2;
+
+			_sponsoredData->lastHintPos = QPoint(
+				radius + inner.left() + _sponsoredData->widthBeforeHint,
+				tshift
+					+ (_siteName.style()->font->height - height) / 2
+					+ st::webPageSponsoredHintFont->descent / 2);
+			const auto rect = QRect(
+				_sponsoredData->lastHintPos,
+				_sponsoredData->hintSize);
+			auto hq = PainterHighQualityEnabler(p);
+			p.setPen(Qt::NoPen);
+			p.setBrush(color);
+			p.drawRoundedRect(rect, radius, radius);
+
+			p.setPen(cache->icon);
+			p.setBrush(Qt::NoBrush);
+			p.setFont(st::webPageSponsoredHintFont);
+			p.drawText(
+				rect,
+				tr::lng_sponsored_message_revenue_button(tr::now),
+				style::al_center);
+		}
 		tshift += lineHeight;
 
 		p.setTextPalette(stm->textPalette);
@@ -1077,8 +1145,17 @@ TextState WebPage::textState(QPoint point, StateRequest request) const {
 	//if ((!result.link || _sponsoredData) && outer.contains(point)) {
 	//	result.link = _openl;
 	//}
-	if (_data->iv) {
+	if (_data->iv || _sponsoredData && outer.contains(point)) {
 		result.link = _openl;
+	}
+	if (_sponsoredData && _sponsoredData->canReport) {
+		const auto contains = QRect(
+			_sponsoredData->lastHintPos,
+			_sponsoredData->hintSize).contains(point
+				- QPoint(0, st::msgDateFont->height));
+		if (contains) {
+			result.link = _sponsoredData->hintLink;
+		}
 	}
 	_lastPoint = point - outer.topLeft();
 
@@ -1150,6 +1227,28 @@ void WebPage::clickHandlerActiveChanged(
 void WebPage::clickHandlerPressedChanged(
 		const ClickHandlerPtr &p,
 		bool pressed) {
+	if (_sponsoredData && _sponsoredData->hintLink == p) {
+		if (pressed) {
+			if (!_sponsoredData->hintRipple) {
+				const auto owner = &parent()->history()->owner();
+				auto ripple = std::make_unique<Ui::RippleAnimation>(
+					st::defaultRippleAnimation,
+					Ui::RippleAnimation::RoundRectMask(
+						_sponsoredData->hintSize,
+						_st.radius),
+					[=] { owner->requestViewRepaint(parent()); });
+				_sponsoredData->hintRipple = std::move(ripple);
+			}
+			const auto full = Rect(currentSize());
+			const auto outer = full - inBubblePadding();
+			_sponsoredData->hintRipple->add(_lastPoint
+				+ outer.topLeft()
+				- _sponsoredData->lastHintPos);
+		} else if (_sponsoredData->hintRipple) {
+			_sponsoredData->hintRipple->lastStop();
+		}
+		return;
+	}
 	if (p == _openl) {
 		if (pressed) {
 			if (!_ripple) {

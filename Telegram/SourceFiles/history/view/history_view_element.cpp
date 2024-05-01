@@ -39,10 +39,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/text/text_utilities.h"
 #include "ui/item_text_options.h"
 #include "ui/painter.h"
+#include "data/components/sponsored_messages.h"
 #include "data/data_session.h"
 #include "data/data_forum.h"
 #include "data/data_forum_topic.h"
-#include "data/data_sponsored_messages.h"
 #include "data/data_message_reactions.h"
 #include "data/data_user.h"
 #include "lang/lang_keys.h"
@@ -279,7 +279,7 @@ QString DateTooltipText(not_null<Element*> view) {
 			dateText += '\n' + tr::lng_signed_author(
 				tr::now,
 				lt_user,
-				msgsigned->postAuthor);
+				msgsigned->author);
 		}
 	}
 	if (item->isScheduled() && item->isSilent()) {
@@ -756,14 +756,16 @@ void Element::refreshMedia(Element *replacing) {
 		const auto emojiStickers = &history()->session().emojiStickersPack();
 		const auto skipPremiumEffect = false;
 		if (const auto sticker = emojiStickers->stickerForEmoji(emoji)) {
+			auto content = std::make_unique<Sticker>(
+				this,
+				sticker.document,
+				skipPremiumEffect,
+				replacing,
+				sticker.replacements);
+			content->setEmojiSticker();
 			_media = std::make_unique<UnwrappedMedia>(
 				this,
-				std::make_unique<Sticker>(
-					this,
-					sticker.document,
-					skipPremiumEffect,
-					replacing,
-					sticker.replacements));
+				std::move(content));
 		} else {
 			_media = std::make_unique<UnwrappedMedia>(
 				this,
@@ -1109,7 +1111,7 @@ ClickHandlerPtr Element::fromLink() const {
 			}
 			const auto my = context.other.value<ClickHandlerContext>();
 			if (const auto window = ContextOrSessionWindow(my, session)) {
-				auto &sponsored = session->data().sponsoredMessages();
+				auto &sponsored = session->sponsoredMessages();
 				const auto itemId = my.itemId ? my.itemId : item->fullId();
 				const auto details = sponsored.lookupDetails(itemId);
 				if (!details.externalLink.isEmpty()) {

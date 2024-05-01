@@ -28,6 +28,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "storage/file_upload.h"
 #include "storage/storage_account.h"
 #include "storage/storage_facade.h"
+#include "data/components/scheduled_messages.h"
+#include "data/components/sponsored_messages.h"
 #include "data/data_session.h"
 #include "data/data_changes.h"
 #include "data/data_user.h"
@@ -96,6 +98,8 @@ Session::Session(
 , _giftBoxStickersPacks(std::make_unique<Stickers::GiftBoxPack>(this))
 , _sendAsPeers(std::make_unique<SendAsPeers>(this))
 , _attachWebView(std::make_unique<InlineBots::AttachWebView>(this))
+, _scheduledMessages(std::make_unique<Data::ScheduledMessages>(this))
+, _sponsoredMessages(std::make_unique<Data::SponsoredMessages>(this))
 , _supportHelper(Support::Helper::Create(this))
 , _saveSettingsTimer([=] { saveSettings(); }) {
 	Expects(_settings != nullptr);
@@ -138,10 +142,10 @@ Session::Session(
 		}, _lifetime);
 
 #ifndef OS_MAC_STORE
-		_account->appConfig().value(
+		appConfig().value(
 		) | rpl::start_with_next([=] {
-			_premiumPossible = !_account->appConfig().get<bool>(
-				"premium_purchase_blocked",
+			_premiumPossible = !appConfig().get<bool>(
+				u"premium_purchase_blocked"_q,
 				true);
 		}, _lifetime);
 #endif // OS_MAC_STORE
@@ -225,6 +229,10 @@ Domain &Session::domain() const {
 
 Storage::Domain &Session::domainLocal() const {
 	return _account->domainLocal();
+}
+
+AppConfig &Session::appConfig() const {
+	return _account->appConfig();
 }
 
 void Session::notifyDownloaderTaskFinished() {
