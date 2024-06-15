@@ -7,12 +7,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "history/history_inner_widget.h"
 
+#include "chat_helpers/stickers_emoji_pack.h"
 #include "core/file_utilities.h"
 #include <core/shortcuts.h>
 #include "core/click_handler_types.h"
 #include "history/history_item_helpers.h"
 #include "history/view/controls/history_view_forward_panel.h"
 #include "history/view/controls/history_view_draft_options.h"
+#include "boxes/moderate_messages_box.h"
 #include "history/view/media/history_view_sticker.h"
 #include "history/view/media/history_view_web_page.h"
 #include "history/view/reactions/history_view_reactions_button.h"
@@ -35,6 +37,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/effects/reaction_fly_animation.h"
 #include "ui/text/text_options.h"
 #include "ui/text/text_entity.h"
+#include "ui/text/text_isolated_emoji.h"
+#include "ui/boxes/edit_factcheck_box.h"
 #include "ui/boxes/report_box.h"
 #include "ui/layers/generic_box.h"
 #include "ui/controls/delete_message_context_action.h"
@@ -64,6 +68,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "main/main_session_settings.h"
 #include "main/session/send_as_peers.h"
+#include "mainwidget.h"
 #include "menu/menu_item_download_files.h"
 #include "core/application.h"
 #include "facades.h"
@@ -74,6 +79,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "api/api_who_reacted.h"
 #include "api/api_views.h"
 #include "lang/lang_keys.h"
+#include "data/components/factchecks.h"
 #include "data/components/sponsored_messages.h"
 #include "data/data_session.h"
 #include "data/data_document.h"
@@ -165,7 +171,13 @@ void FillSponsoredMessagesMenu(
 		menu->addSeparator(&st::expandedMenuSeparator);
 	}
 	menu->addAction(tr::lng_sponsored_hide_ads(tr::now), [=] {
-		ShowPremiumPreviewBox(controller, PremiumFeature::NoAds);
+		if (controller->session().premium()) {
+			using Result = Data::SponsoredReportResult;
+			controller->session().sponsoredMessages().createReportCallback(
+				itemId)(Result::Id("-1"), [](const auto &) {});
+		} else {
+			ShowPremiumPreviewBox(controller, PremiumFeature::NoAds);
+		}
 	}, &st::menuIconCancel);
 }
 
@@ -302,10 +314,16 @@ public:
 			_widget->elementStartPremium(view, replacing);
 		}
 	}
-
 	void elementCancelPremium(not_null<const Element*> view) override {
 		if (_widget) {
 			_widget->elementCancelPremium(view);
+		}
+	}
+	void elementStartEffect(
+			not_null<const Element*> view,
+			Element *replacing) override {
+		if (_widget) {
+			_widget->elementStartEffect(view, replacing);
 		}
 	}
 
@@ -332,6 +350,8 @@ HistoryInner::HistoryInner(
 , _history(history)
 , _elementDelegate(_history->delegateMixin()->delegate())
 , _emojiInteractions(std::make_unique<HistoryView::EmojiInteractions>(
+	this,
+	controller->content(),
 	&controller->session(),
 	[=](not_null<const Element*> view) { return itemTop(view); }))
 , _migrated(history->migrateFrom())
@@ -343,8 +363,7 @@ HistoryInner::HistoryInner(
 , _reactionsManager(
 	std::make_unique<HistoryView::Reactions::Manager>(
 		this,
-		[=](QRect updated) { update(updated); },
-		controller->cachedReactionIconFactory().createMethod()))
+		[=](QRect updated) { update(updated); }))
 , _touchSelectTimer([=] { onTouchSelect(); })
 , _touchScrollTimer([=] { onTouchScrollTimer(); })
 , _scrollDateCheck([this] { scrollDateCheck(); })
@@ -385,10 +404,6 @@ HistoryInner::HistoryInner(
 		if (const auto view = viewByItem(request.item)) {
 			_emojiInteractions->play(std::move(request), view);
 		}
-	}, lifetime());
-	_emojiInteractions->updateRequests(
-	) | rpl::start_with_next([=](QRect rect) {
-		update(rect);
 	}, lifetime());
 	_emojiInteractions->playStarted(
 	) | rpl::start_with_next([=](QString &&emoji) {
@@ -903,6 +918,14 @@ Ui::ChatPaintContext HistoryInner::preparePaintContext(
 	});
 }
 
+void HistoryInner::startEffectOnRead(not_null<HistoryItem*> item) {
+	if (item->history() == _history) {
+		if (const auto view = item->mainView()) {
+			_emojiInteractions->playEffectOnRead(view);
+		}
+	}
+}
+
 void HistoryInner::paintEvent(QPaintEvent *e) {
 	if (_controller->contentOverlapped(this, e)
 		|| hasPendingResizedItems()) {
@@ -950,12 +973,18 @@ void HistoryInner::paintEvent(QPaintEvent *e) {
 	_translateTracker->startBunch();
 	auto readTill = (HistoryItem*)nullptr;
 	auto readContents = base::flat_set<not_null<HistoryItem*>>();
+	auto startEffects = base::flat_set<not_null<const Element*>>();
 	const auto markingAsViewed = _widget->markingContentsRead();
 	const auto guard = gsl::finally([&] {
 		if (_pinnedItem) {
 			_translateTracker->add(_pinnedItem);
 		}
 		_translateTracker->finishBunch();
+		if (!startEffects.empty()) {
+			for (const auto &view : startEffects) {
+				_emojiInteractions->playEffectOnRead(view);
+			}
+		}
 		if (readTill && _widget->markingMessagesRead()) {
 			session().data().histories().readInboxTill(readTill);
 		}
@@ -991,6 +1020,9 @@ void HistoryInner::paintEvent(QPaintEvent *e) {
 				session().sponsoredMessages().view(item->fullId());
 			} else if (isUnread) {
 				readTill = item;
+			}
+			if (markingAsViewed && item->hasUnwatchedEffect()) {
+				startEffects.emplace(view);
 			}
 			if (markingAsViewed && item->hasViews()) {
 				session().api().views().scheduleIncrement(item);
@@ -1216,7 +1248,6 @@ void HistoryInner::paintEvent(QPaintEvent *e) {
 	p.setOpacity(1.);
 
 	_reactionsManager->paint(p, context);
-	_emojiInteractions->paint(p);
 }
 
 bool HistoryInner::eventHook(QEvent *e) {
@@ -1716,14 +1747,24 @@ std::unique_ptr<QMimeData> HistoryInner::prepareDrag() {
 		return mimeData;
 	} else if (pressedView) {
 		auto forwardIds = MessageIdsList();
-		if (_mouseCursorState == CursorState::Date) {
+		const auto tryForwardSelection = uponSelected
+			&& !_controller->adaptive().isOneColumn();
+		const auto forwardSelectionState = tryForwardSelection
+			? getSelectionState()
+			: HistoryView::TopBarWidget::SelectedState();
+		if (forwardSelectionState.count > 0
+			&& (forwardSelectionState.count
+				== forwardSelectionState.canForwardCount)) {
+			forwardIds = getSelectedItems();
+		} else if (_mouseCursorState == CursorState::Date) {
 			forwardIds = session().data().itemOrItsGroup(_mouseActionItem);
-		} else if (pressedView->isHiddenByGroup() && pressedHandler) {
-			forwardIds = MessageIdsList(1, _mouseActionItem->fullId());
-		} else if (const auto media = pressedView->media()) {
-			if (media->dragItemByHandler(pressedHandler)) {
-				forwardIds = MessageIdsList(1, _mouseActionItem->fullId());
-			}
+		} else if ((pressedView->isHiddenByGroup() && pressedHandler)
+			|| (pressedView->media()
+				&& pressedView->media()->dragItemByHandler(pressedHandler))) {
+			const auto item = _dragStateItem
+				? _dragStateItem
+				: _mouseActionItem;
+			forwardIds = MessageIdsList(1, item->fullId());
 		}
 		if (forwardIds.empty()) {
 			return nullptr;
@@ -2170,6 +2211,20 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 				}
 			}, &st::menuIconEdit);
 		}
+		if (session->factchecks().canEdit(item)) {
+			const auto text = item->factcheckText();
+			const auto phrase = text.empty()
+				? tr::lng_context_add_factcheck(tr::now)
+				: tr::lng_context_edit_factcheck(tr::now);
+			_menu->addAction(phrase, [=] {
+				const auto limit = session->factchecks().lengthLimit();
+				controller->show(Box(EditFactcheckBox, text, limit, [=](
+						TextWithEntities result) {
+					const auto show = controller->uiShow();
+					session->factchecks().save(itemId, text, result, show);
+				}, FactcheckFieldIniter(controller->uiShow())));
+			}, &st::menuIconFactcheck);
+		}
 		const auto pinItem = (item->canPin() && item->isPinned())
 			? item
 			: groupLeaderOrSelf(item);
@@ -2289,6 +2344,20 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 			}, &st::menuIconStickers);
 		}
 	};
+
+#ifdef _DEBUG // Sometimes we need to save emoji to files.
+	if (const auto item = _dragStateItem) {
+		const auto emojiStickers = &session->emojiStickersPack();
+		if (const auto view = item->media() ? nullptr : item->mainView()) {
+			if (const auto isolated = view->isolatedEmoji()) {
+				if (const auto sticker = emojiStickers->stickerForEmoji(
+						isolated)) {
+					addDocumentActions(sticker.document, item);
+				}
+			}
+		}
+	}
+#endif
 
 	const auto asGroup = !Element::Moused()
 		|| (Element::Moused() != Element::Hovered())
@@ -2423,7 +2492,11 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 			const auto quoteOffset = selected.offset;
 			text.replace('&', u"&&"_q);
 			_menu->addAction(text, [=] {
-				if (canSendReply) {
+				const auto still = session->data().message(itemId);
+				const auto forceAnotherChat = base::IsCtrlPressed()
+					&& still
+					&& still->allowsForward();
+				if (canSendReply && !forceAnotherChat) {
 					_widget->replyToMessage({
 						.messageId = itemId,
 						.quote = quote,
@@ -3001,8 +3074,7 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 			desiredPosition,
 			reactItem,
 			[=](ChosenReaction reaction) { reactionChosen(reaction); },
-			ItemReactionsAbout(reactItem),
-			_controller->cachedReactionIconFactory().createMethod())
+			ItemReactionsAbout(reactItem))
 		: AttachSelectorResult::Skipped;
 	if (attached == AttachSelectorResult::Failed) {
 		_menu = nullptr;
@@ -3806,6 +3878,12 @@ void HistoryInner::elementCancelPremium(not_null<const Element*> view) {
 	_emojiInteractions->cancelPremiumEffect(view);
 }
 
+void HistoryInner::elementStartEffect(
+		not_null<const Element*> view,
+		Element *replacing) {
+	_emojiInteractions->playEffect(view);
+}
+
 auto HistoryInner::getSelectionState() const
 -> HistoryView::TopBarWidget::SelectedState {
 	auto result = HistoryView::TopBarWidget::SelectedState {};
@@ -4540,8 +4618,13 @@ void HistoryInner::deleteItem(not_null<HistoryItem*> item) {
 		_controller->cancelUploadLayer(item);
 		return;
 	}
-	const auto suggestModerateActions = true;
-	_controller->show(Box<DeleteMessagesBox>(item, suggestModerateActions));
+	const auto list = HistoryItemsList{ item };
+	if (CanCreateModerateMessagesBox(list)) {
+		_controller->show(Box(CreateModerateMessagesBox, list, nullptr));
+	} else {
+		const auto suggestModerate = false;
+		_controller->show(Box<DeleteMessagesBox>(item, suggestModerate));
+	}
 }
 
 bool HistoryInner::hasPendingResizedItems() const {
@@ -4554,10 +4637,16 @@ void HistoryInner::deleteAsGroup(FullMsgId itemId) {
 		const auto group = session().data().groups().find(item);
 		if (!group) {
 			return deleteItem(item);
+		} else if (CanCreateModerateMessagesBox(group->items)) {
+			_controller->show(Box(
+				CreateModerateMessagesBox,
+				group->items,
+				nullptr));
+		} else {
+			_controller->show(Box<DeleteMessagesBox>(
+				&session(),
+				session().data().itemsToIds(group->items)));
 		}
-		_controller->show(Box<DeleteMessagesBox>(
-			&session(),
-			session().data().itemsToIds(group->items)));
 	}
 }
 

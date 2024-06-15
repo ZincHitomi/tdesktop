@@ -41,6 +41,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/business/data_business_info.h"
 #include "data/business/data_shortcut_messages.h"
 #include "data/components/scheduled_messages.h"
+#include "data/components/sponsored_messages.h"
 #include "data/stickers/data_stickers.h"
 #include "data/notify/data_notify_settings.h"
 #include "data/data_bot_app.h"
@@ -398,6 +399,7 @@ void Session::clear() {
 	_histories->unloadAll();
 	_shortcutMessages = nullptr;
 	_session->scheduledMessages().clear();
+	_session->sponsoredMessages().clear();
 	_dependentMessages.clear();
 	base::take(_messages);
 	base::take(_nonChannelMessages);
@@ -696,7 +698,7 @@ not_null<UserData*> Session::processUser(const MTPUser &data) {
 				result->setAccessHash(accessHash->v);
 			}
 			status = data.vstatus();
-			{
+			if (!minimal) {
 				const auto newUsername = uname;
 				const auto newUsernames = data.vusernames()
 					? Api::Usernames::FromTL(*data.vusernames())
@@ -755,8 +757,10 @@ not_null<UserData*> Session::processUser(const MTPUser &data) {
 		result->setLoadedStatus(PeerData::LoadedStatus::Normal);
 	}
 
-	if (status && !minimal) {
-		const auto lastseen = LastseenFromMTP(*status, result->lastseen());
+	if (!minimal) {
+		const auto lastseen = status
+			? LastseenFromMTP(*status, result->lastseen())
+			: Data::LastseenStatus::LongAgo(false);
 		if (result->updateLastseen(lastseen)) {
 			flags |= UpdateFlag::OnlineStatus;
 		}
@@ -1830,11 +1834,16 @@ rpl::producer<not_null<HistoryItem*>> Session::itemDataChanges() const {
 }
 
 void Session::requestItemTextRefresh(not_null<HistoryItem*> item) {
-	if (const auto i = _views.find(item); i != _views.end()) {
-		for (const auto &view : i->second) {
+	const auto call = [&](not_null<HistoryItem*> item) {
+		enumerateItemViews(item, [&](not_null<ViewElement*> view) {
 			view->itemTextUpdated();
-		}
+		});
 		requestItemResize(item);
+	};
+	if (const auto group = groups().find(item)) {
+		call(group->items.front());
+	} else {
+		call(item);
 	}
 }
 
@@ -3391,6 +3400,7 @@ not_null<WebPageData*> Session::processWebpage(
 		nullptr,
 		WebPageCollage(),
 		nullptr,
+		nullptr,
 		0,
 		QString(),
 		false,
@@ -3416,6 +3426,7 @@ not_null<WebPageData*> Session::webpage(
 		nullptr,
 		WebPageCollage(),
 		nullptr,
+		nullptr,
 		0,
 		QString(),
 		false,
@@ -3434,6 +3445,7 @@ not_null<WebPageData*> Session::webpage(
 		DocumentData *document,
 		WebPageCollage &&collage,
 		std::unique_ptr<Iv::Data> iv,
+		std::unique_ptr<WebPageStickerSet> stickerSet,
 		int duration,
 		const QString &author,
 		bool hasLargeMedia,
@@ -3452,6 +3464,7 @@ not_null<WebPageData*> Session::webpage(
 		document,
 		std::move(collage),
 		std::move(iv),
+		std::move(stickerSet),
 		duration,
 		author,
 		hasLargeMedia,
@@ -3492,10 +3505,35 @@ void Session::webpageApplyFields(
 				const auto result = attribute.match([&](
 						const MTPDwebPageAttributeTheme &data) {
 					return lookupInAttribute(data);
-				}, [&](const MTPDwebPageAttributeStory &data) {
+				}, [](const MTPDwebPageAttributeStory &) {
+					return (DocumentData*)nullptr;
+				}, [](const MTPDwebPageAttributeStickerSet &) {
 					return (DocumentData*)nullptr;
 				});
 				if (result) {
+					return result;
+				}
+			}
+		}
+		return nullptr;
+	};
+	using WebPageStickerSetPtr = std::unique_ptr<WebPageStickerSet>;
+	const auto lookupStickerSet = [&]() -> WebPageStickerSetPtr {
+		if (const auto attributes = data.vattributes()) {
+			for (const auto &attribute : attributes->v) {
+				auto result = attribute.match([&](
+						const MTPDwebPageAttributeStickerSet &data) {
+					auto result = std::make_unique<WebPageStickerSet>();
+					result->isEmoji = data.is_emojis();
+					result->isTextColor = data.is_text_color();
+					for (const auto &tl : data.vstickers().v) {
+						result->items.push_back(processDocument(tl));
+					}
+					return result;
+				}, [](const auto &) {
+					return WebPageStickerSetPtr(nullptr);
+				});
+				if (result && !result->items.empty()) {
 					return result;
 				}
 			}
@@ -3593,6 +3631,7 @@ void Session::webpageApplyFields(
 			: lookupThemeDocument()),
 		WebPageCollage(this, data),
 		std::move(iv),
+		lookupStickerSet(),
 		data.vduration().value_or_empty(),
 		qs(data.vauthor().value_or_empty()),
 		data.is_has_large_media(),
@@ -3612,6 +3651,7 @@ void Session::webpageApplyFields(
 		DocumentData *document,
 		WebPageCollage &&collage,
 		std::unique_ptr<Iv::Data> iv,
+		std::unique_ptr<WebPageStickerSet> stickerSet,
 		int duration,
 		const QString &author,
 		bool hasLargeMedia,
@@ -3629,6 +3669,7 @@ void Session::webpageApplyFields(
 		document,
 		std::move(collage),
 		std::move(iv),
+		std::move(stickerSet),
 		duration,
 		author,
 		hasLargeMedia,
@@ -4228,28 +4269,26 @@ void Session::notifyPollUpdateDelayed(not_null<PollData*> poll) {
 }
 
 void Session::sendWebPageGamePollNotifications() {
+	auto resize = std::vector<not_null<ViewElement*>>();
 	for (const auto &page : base::take(_webpagesUpdated)) {
 		_webpageUpdates.fire_copy(page);
-		const auto i = _webpageViews.find(page);
-		if (i != _webpageViews.end()) {
-			for (const auto &view : i->second) {
-				requestViewResize(view);
-			}
+		if (const auto i = _webpageViews.find(page)
+			; i != _webpageViews.end()) {
+			resize.insert(end(resize), begin(i->second), end(i->second));
 		}
 	}
 	for (const auto &game : base::take(_gamesUpdated)) {
 		if (const auto i = _gameViews.find(game); i != _gameViews.end()) {
-			for (const auto &view : i->second) {
-				requestViewResize(view);
-			}
+			resize.insert(end(resize), begin(i->second), end(i->second));
 		}
 	}
 	for (const auto &poll : base::take(_pollsUpdated)) {
 		if (const auto i = _pollViews.find(poll); i != _pollViews.end()) {
-			for (const auto &view : i->second) {
-				requestViewResize(view);
-			}
+			resize.insert(end(resize), begin(i->second), end(i->second));
 		}
+	}
+	for (const auto &view : resize) {
+		requestViewResize(view);
 	}
 }
 
@@ -4549,7 +4588,9 @@ void Session::insertCheckedServiceNotification(
 				MTPMessageReactions(),
 				MTPVector<MTPRestrictionReason>(),
 				MTPint(), // ttl_period
-				MTPint()), // quick_reply_shortcut_id
+				MTPint(), // quick_reply_shortcut_id
+				MTPlong(), // effect
+				MTPFactCheck()),
 			localFlags,
 			NewMessageType::Unread);
 	}

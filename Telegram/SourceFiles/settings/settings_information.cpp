@@ -895,7 +895,7 @@ not_null<Ui::SlideWrap<Ui::SettingsButton>*> AccountsList::setupAdd() {
 				found = true;
 			}
 		}
-		if (!found && domain.accounts().size() >= domain.maxAccounts()) {
+		if (!found && domain.accounts().size() >= 10) {
 			_controller->show(
 				Box(AccountsLimitBox, &_controller->session()));
 		} else if (newWindow) {
@@ -984,9 +984,7 @@ void AccountsList::rebuild() {
 					_closeRequests.fire({});
 					return;
 				}
-				const auto newWindow = (modifiers & Qt::ControlModifier)
-					&& base::options::lookup<bool>(
-						Dialogs::kOptionCtrlClickChatNewWindow).value();
+				const auto newWindow = (modifiers & Qt::ControlModifier);
 				auto activate = [=, guard = _accountSwitchGuard.make_guard()]{
 					if (guard) {
 						_reorder->finishReordering();

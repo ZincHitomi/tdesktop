@@ -21,6 +21,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/business/data_shortcut_messages.h"
 #include "data/components/scheduled_messages.h"
 #include "data/components/sponsored_messages.h"
+#include "data/components/top_peers.h"
 #include "data/notify/data_notify_settings.h"
 #include "data/stickers/data_stickers.h"
 #include "data/data_drafts.h"
@@ -40,6 +41,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_user.h"
 #include "data/data_document.h"
 #include "data/data_histories.h"
+#include "data/data_history_messages.h"
 #include "lang/lang_keys.h"
 #include "apiwrap.h"
 #include "api/api_chat_participants.h"
@@ -422,16 +424,21 @@ not_null<HistoryItem*> History::createItem(
 		MsgId id,
 		const MTPMessage &message,
 		MessageFlags localFlags,
-		bool detachExistingItem) {
+		bool detachExistingItem,
+		bool newMessage) {
 	if (const auto result = owner().message(peer, id)) {
 		if (detachExistingItem) {
 			result->removeMainView();
 		}
 		return result;
 	}
-	return message.match([&](const auto &data) {
+	const auto result = message.match([&](const auto &data) {
 		return makeMessage(id, data, localFlags);
 	});
+	if (newMessage && result->out() && result->isRegular()) {
+		session().topPeers().increment(peer, result->date());
+	}
+	return result;
 }
 
 std::vector<not_null<HistoryItem*>> History::createItems(
@@ -456,23 +463,28 @@ not_null<HistoryItem*> History::addNewMessage(
 		const MTPMessage &message,
 		MessageFlags localFlags,
 		NewMessageType type) {
-	const auto detachExisting = (type == NewMessageType::Unread);
-	const auto item = createItem(id, message, localFlags, detachExisting);
+	const auto newMessage = (type == NewMessageType::Unread);
+	const auto detachExisting = newMessage;
+	const auto item = createItem(
+		id,
+		message,
+		localFlags,
+		detachExisting,
+		newMessage);
 	if (type == NewMessageType::Existing || item->mainView()) {
 		return item;
 	}
-	const auto unread = (type == NewMessageType::Unread);
-	if (unread && item->isHistoryEntry()) {
+	if (newMessage && item->isHistoryEntry()) {
 		applyMessageChanges(item, message);
 	}
-	return addNewItem(item, unread);
+	return addNewItem(item, newMessage);
 }
 
 not_null<HistoryItem*> History::insertItem(
 		std::unique_ptr<HistoryItem> item) {
 	Expects(item != nullptr);
 
-	const auto &[i, ok] = _messages.insert(std::move(item));
+	const auto &[i, ok] = _items.insert(std::move(item));
 
 	const auto result = i->get();
 	owner().registerMessage(result);
@@ -489,6 +501,9 @@ void History::destroyMessage(not_null<HistoryItem*> item) {
 		// All this must be done for all items manually in History::clear()!
 		item->destroyHistoryEntry();
 		if (item->isRegular()) {
+			if (const auto messages = _messages.get()) {
+				messages->removeOne(item->id);
+			}
 			if (const auto types = item->sharedMediaTypes()) {
 				session().storage().remove(Storage::SharedMediaRemoveOne(
 					peerId,
@@ -513,11 +528,11 @@ void History::destroyMessage(not_null<HistoryItem*> item) {
 	Core::App().notifications().clearFromItem(item);
 
 	auto hack = std::unique_ptr<HistoryItem>(item.get());
-	const auto i = _messages.find(hack);
+	const auto i = _items.find(hack);
 	hack.release();
 
-	Assert(i != end(_messages));
-	_messages.erase(i);
+	Assert(i != end(_items));
+	_items.erase(i);
 
 	if (documentToCancel) {
 		session().data().documentMessageRemoved(documentToCancel);
@@ -526,8 +541,8 @@ void History::destroyMessage(not_null<HistoryItem*> item) {
 
 void History::destroyMessagesByDates(TimeId minDate, TimeId maxDate) {
 	auto toDestroy = std::vector<not_null<HistoryItem*>>();
-	toDestroy.reserve(_messages.size());
-	for (const auto &message : _messages) {
+	toDestroy.reserve(_items.size());
+	for (const auto &message : _items) {
 		if (message->isRegular()
 			&& message->date() > minDate
 			&& message->date() < maxDate) {
@@ -541,8 +556,8 @@ void History::destroyMessagesByDates(TimeId minDate, TimeId maxDate) {
 
 void History::destroyMessagesByTopic(MsgId topicRootId) {
 	auto toDestroy = std::vector<not_null<HistoryItem*>>();
-	toDestroy.reserve(_messages.size());
-	for (const auto &message : _messages) {
+	toDestroy.reserve(_items.size());
+	for (const auto &message : _items) {
 		if (message->topicRootId() == topicRootId) {
 			toDestroy.push_back(message.get());
 		}
@@ -553,7 +568,7 @@ void History::destroyMessagesByTopic(MsgId topicRootId) {
 }
 
 void History::editHistoryMessages(PeerData* peer, bool isHide) {
-	for (const auto& message : _messages) {
+	for (const auto &message : _items) {
 		if (message->isRegular() && !message->isService() && message->from() == peer) {
 			if (isHide) {
 				hideMessage(message.get());
@@ -601,7 +616,7 @@ void History::unpinMessagesFor(MsgId topicRootId) {
 				topic->setHasPinnedMessages(false);
 			});
 		}
-		for (const auto &item : _messages) {
+		for (const auto &item : _items) {
 			if (item->isPinned()) {
 				item->setIsPinned(false);
 			}
@@ -615,7 +630,7 @@ void History::unpinMessagesFor(MsgId topicRootId) {
 		if (const auto topic = peer->forumTopicFor(topicRootId)) {
 			topic->setHasPinnedMessages(false);
 		}
-		for (const auto &item : _messages) {
+		for (const auto &item : _items) {
 			if (item->isPinned() && item->topicRootId() == topicRootId) {
 				item->setIsPinned(false);
 			}
@@ -807,9 +822,12 @@ not_null<HistoryItem*> History::addNewToBack(
 	addItemToBlock(item);
 
 	if (!unread && item->isRegular()) {
+		const auto from = loadedAtTop() ? 0 : minMsgId();
+		const auto till = loadedAtBottom() ? ServerMaxMsgId : maxMsgId();
+		if (_messages) {
+			_messages->addExisting(item->id, { from, till });
+		}
 		if (const auto types = item->sharedMediaTypes()) {
-			auto from = loadedAtTop() ? 0 : minMsgId();
-			auto till = loadedAtBottom() ? ServerMaxMsgId : maxMsgId();
 			auto &storage = session().storage();
 			storage.add(Storage::SharedMediaAddExisting(
 				peer->id,
@@ -1216,6 +1234,7 @@ void History::mainViewRemoved(
 
 void History::newItemAdded(not_null<HistoryItem*> item) {
 	item->indexAsNewItem();
+	item->addToMessagesIndex();
 	if (const auto from = item->from() ? item->from()->asUser() : nullptr) {
 		if (from == item->author()) {
 			_sendActionPainter.clear(from);
@@ -1769,6 +1788,10 @@ MsgId History::loadAroundId() const {
 		return *_inboxReadBefore;
 	}
 	return MsgId(0);
+}
+
+bool History::inboxReadTillKnown() const {
+	return _inboxReadBefore.has_value();
 }
 
 MsgId History::inboxReadTillId() const {
@@ -2411,6 +2434,9 @@ void History::setNotLoadedAtBottom() {
 
 	session().storage().invalidate(
 		Storage::SharedMediaInvalidateBottom(peer->id));
+	if (const auto messages = _messages.get()) {
+		messages->invalidateBottom();
+	}
 }
 
 void History::clearSharedMedia() {
@@ -2942,6 +2968,9 @@ void History::setInboxReadTill(MsgId upTo) {
 		accumulate_max(*_inboxReadBefore, upTo + 1);
 	} else {
 		_inboxReadBefore = upTo + 1;
+		for (const auto &item : _items) {
+			item->applyEffectWatchedOnUnreadKnown();
+		}
 	}
 }
 
@@ -3118,6 +3147,48 @@ MsgRange History::rangeForDifferenceRequest() const {
 	return MsgRange();
 }
 
+Data::HistoryMessages &History::messages() {
+	if (!_messages) {
+		_messages = std::make_unique<Data::HistoryMessages>();
+
+		const auto max = maxMsgId();
+		const auto from = loadedAtTop() ? 0 : minMsgId();
+		const auto till = loadedAtBottom() ? ServerMaxMsgId : max;
+		auto list = std::vector<MsgId>();
+		list.reserve(std::min(
+			int(_items.size()),
+			int(blocks.size()) * kNewBlockEachMessage));
+		auto sort = false;
+		for (const auto &block : blocks) {
+			for (const auto &view : block->messages) {
+				const auto item = view->data();
+				if (item->isRegular()) {
+					const auto id = item->id;
+					if (!list.empty() && list.back() >= id) {
+						sort = true;
+					}
+					list.push_back(id);
+				}
+			}
+		}
+		if (sort) {
+			ranges::sort(list);
+		}
+		if (max || (loadedAtTop() && loadedAtBottom())) {
+			_messages->addSlice(std::move(list), { from, till }, {});
+		}
+	}
+	return *_messages;
+}
+
+const Data::HistoryMessages &History::messages() const {
+	return const_cast<History*>(this)->messages();
+}
+
+Data::HistoryMessages *History::maybeMessages() {
+	return _messages.get();
+}
+
 HistoryItem *History::insertJoinedMessage() {
 	const auto channel = peer->asChannel();
 	if (!channel
@@ -3220,11 +3291,11 @@ void History::removeJoinedMessage() {
 
 void History::reactionsEnabledChanged(bool enabled) {
 	if (!enabled) {
-		for (const auto &item : _messages) {
+		for (const auto &item : _items) {
 			item->updateReactions(nullptr);
 		}
 	} else {
-		for (const auto &item : _messages) {
+		for (const auto &item : _items) {
 			item->updateReactionsUnknown();
 		}
 	}
@@ -3398,6 +3469,9 @@ void History::clear(ClearType type) {
 		}
 		_loadedAtTop = _loadedAtBottom = _lastMessage.has_value();
 		clearSharedMedia();
+		if (const auto messages = _messages.get()) {
+			messages->removeAll();
+		}
 		clearLastKeyboard();
 	}
 
@@ -3414,8 +3488,8 @@ void History::clear(ClearType type) {
 
 void History::clearUpTill(MsgId availableMinId) {
 	auto remove = std::vector<not_null<HistoryItem*>>();
-	remove.reserve(_messages.size());
-	for (const auto &item : _messages) {
+	remove.reserve(_items.size());
+	for (const auto &item : _items) {
 		const auto itemId = item->id;
 		if (!item->isRegular()) {
 			continue;

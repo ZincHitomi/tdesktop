@@ -96,6 +96,7 @@ struct MessageStyle {
 	style::icon historyTranscribeLock = { Qt::Uninitialized };
 	style::icon historyTranscribeHide = { Qt::Uninitialized };
 	style::icon historyVoiceMessageTTL = { Qt::Uninitialized };
+	style::icon liveLocationLongIcon = { Qt::Uninitialized };
 	std::array<
 		std::unique_ptr<Text::QuotePaintCache>,
 		kColorPatternsCount> quoteCache;
@@ -224,6 +225,14 @@ struct ChatPaintContext {
 	bool outbg = false;
 	bool paused = false;
 
+};
+
+struct ChatPaintContextArgs {
+	not_null<ChatTheme*> theme;
+	QRect clip;
+	QPoint visibleAreaPositionGlobal;
+	int visibleAreaTop = 0;
+	int visibleAreaWidth = 0;
 };
 
 [[nodiscard]] int HistoryServiceMsgRadius();
