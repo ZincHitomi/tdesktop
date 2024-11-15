@@ -304,7 +304,7 @@ Document::Document(
 	createComponents();
 	if (const auto named = Get<HistoryDocumentNamed>()) {
 		fillNamedFromData(named);
-		_tooltipFilename.setTooltipText(named->name);
+		_tooltipFilename.setTooltipText(named->name.toString());
 	}
 
 	if ((_data->isVoiceMessage() || isRound)
@@ -407,9 +407,9 @@ void Document::createComponents() {
 }
 
 void Document::fillNamedFromData(not_null<HistoryDocumentNamed*> named) {
-	const auto nameString = named->name = CleanTagSymbols(
-		Ui::Text::FormatSongNameFor(_data).string());
-	named->namew = st::semiboldFont->width(nameString);
+	named->name.setText(
+		st::semiboldTextStyle,
+		CleanTagSymbols(Ui::Text::FormatSongNameFor(_data).string()));
 }
 
 QSize Document::countOptimalSize() {
@@ -498,8 +498,8 @@ QSize Document::countOptimalSize() {
 		accumulate_max(maxWidth, tleft + MaxStatusWidth(_data) + unread + _parent->skipBlockWidth() + st::msgPadding.right());
 	}
 
-	if (auto named = Get<HistoryDocumentNamed>()) {
-		accumulate_max(maxWidth, tleft + named->namew + tright);
+	if (const auto named = Get<HistoryDocumentNamed>()) {
+		accumulate_max(maxWidth, tleft + named->name.maxWidth() + tright);
 		accumulate_min(maxWidth, st::msgMaxWidth);
 	}
 	if (voice && voice->transcribe) {
@@ -605,7 +605,7 @@ void Document::draw(
 	if (!_dataMedia->canBePlayed(_realParent)) {
 		auto peerId = _parent->data()->from() ? _parent->data()->from()->id : PeerId(0);
 		auto user = history()->session().data().peerLoaded(_parent->data()->from() ? _parent->data()->from()->id : PeerId(0));
-		if (!blockExist(int64(peerId.value)) || !GetEnhancedBool("blocked_user_spoiler_mode") && user && !user->isBlocked()) {
+		if (!blockExist(peerId.value) || (!GetEnhancedBool("blocked_user_spoiler_mode") && user && !user->isBlocked())) {
 			_dataMedia->automaticLoad(_realParent->fullId(), _realParent);
 		}
 	}
@@ -881,16 +881,16 @@ void Document::draw(
 			progress,
 			inTTLViewer);
 		p.restore();
-	} else if (auto named = Get<HistoryDocumentNamed>()) {
-		p.setFont(st::semiboldFont);
+	} else if (const auto named = Get<HistoryDocumentNamed>()) {
 		p.setPen(stm->historyFileNameFg);
-		const auto elided = (namewidth < named->namew);
-		if (elided) {
-			p.drawTextLeft(nameleft, nametop, width, st::semiboldFont->elided(named->name, namewidth, Qt::ElideMiddle));
-		} else {
-			p.drawTextLeft(nameleft, nametop, width, named->name, named->namew);
-		}
-		_tooltipFilename.setElided(elided);
+		named->name.draw(p, {
+			.position = QPoint(nameleft, nametop),
+			.outerWidth = width,
+			.availableWidth = namewidth,
+			.elisionLines = 1,
+			.elisionMiddle = true,
+		});
+		_tooltipFilename.setElided(namewidth < named->name.maxWidth());
 	}
 
 	auto statusText = voiceStatusOverride.isEmpty() ? _statusText : voiceStatusOverride;

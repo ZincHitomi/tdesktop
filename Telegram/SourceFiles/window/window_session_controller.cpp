@@ -57,6 +57,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "core/click_handler_types.h"
 #include "core/ui_integration.h"
 #include "base/unixtime.h"
+#include "info/channel_statistics/earn/earn_icons.h"
 #include "ui/controls/userpic_button.h"
 #include "ui/text/text_utilities.h"
 #include "ui/text/format_values.h" // Ui::FormatPhone.
@@ -178,8 +179,8 @@ private:
 	return {
 		.tonEmoji = Ui::Text::SingleCustomEmoji(
 			session->data().customEmojiManager().registerInternalEmoji(
-				Info::ChannelEarn::IconCurrency(
-					st::collectibleInfo,
+				Ui::Earn::IconCurrencyColored(
+					st::collectibleInfo.style.font,
 					st::collectibleInfo.textFg->c),
 				st::collectibleInfoTonMargins,
 				true)),
@@ -567,8 +568,16 @@ void SessionNavigation::showPeerByLinkResolved(
 
 	const auto &replies = info.repliesInfo;
 	if (const auto threadId = std::get_if<ThreadId>(&replies)) {
+		const auto history = peer->owner().history(peer);
+		const auto controller = parentController();
+		if (const auto forum = peer->forum()) {
+			if (controller->windowId().hasChatsList()
+				&& !controller->adaptive().isOneColumn()) {
+				controller->showForum(forum);
+			}
+		}
 		showRepliesForMessage(
-			session().data().history(peer),
+			history,
 			threadId->id,
 			info.messageId,
 			params);
@@ -580,6 +589,8 @@ void SessionNavigation::showPeerByLinkResolved(
 			params);
 	} else if (resolveType == ResolveType::Profile) {
 		showPeerInfo(peer, params);
+	} else if (resolveType == ResolveType::HashtagSearch) {
+		searchMessages(info.text, peer->owner().history(peer));
 	} else if (peer->isForum() && resolveType != ResolveType::Boost) {
 		const auto itemId = info.messageId;
 		if (!itemId) {
@@ -1172,14 +1183,17 @@ void SessionNavigation::showPollResults(
 	showSection(std::make_shared<Info::Memento>(poll, contextId), params);
 }
 
-void SessionNavigation::searchInChat(Dialogs::Key inChat) {
-	searchMessages(QString(), inChat);
+void SessionNavigation::searchInChat(
+		Dialogs::Key inChat,
+		PeerData *searchFrom) {
+	searchMessages(QString(), inChat, searchFrom);
 }
 
 void SessionNavigation::searchMessages(
 		const QString &query,
-		Dialogs::Key inChat) {
-	parentController()->content()->searchMessages(query, inChat, nullptr);
+		Dialogs::Key inChat,
+		PeerData *searchFrom) {
+	parentController()->content()->searchMessages(query, inChat, searchFrom);
 }
 
 auto SessionNavigation::showToast(Ui::Toast::Config &&config)
@@ -1245,8 +1259,7 @@ SessionController::SessionController(
 , _activeChatsFilter(session->data().chatsFilters().defaultId())
 , _openedFolder(window->id().folder())
 , _defaultChatTheme(std::make_shared<Ui::ChatTheme>())
-, _chatStyle(std::make_unique<Ui::ChatStyle>(session->colorIndicesValue()))
-, _giftPremiumValidator(this) {
+, _chatStyle(std::make_unique<Ui::ChatStyle>(session->colorIndicesValue())) {
 	init();
 
 	_chatStyleTheme = _defaultChatTheme;
@@ -1468,24 +1481,6 @@ bool SessionController::hasTabbedSelectorOwnership() const {
 void SessionController::showEditPeerBox(PeerData *peer) {
 	_showEditPeer = peer;
 	session().api().requestFullPeer(peer);
-}
-
-void SessionController::showGiftPremiumBox(UserData *user) {
-	if (user) {
-		_giftPremiumValidator.showBox(user);
-	} else {
-		_giftPremiumValidator.cancel();
-	}
-}
-
-void SessionController::showGiftPremiumsBox(const QString &ref) {
-	_giftPremiumValidator.showChoosePeerBox(ref);
-}
-
-void SessionController::showGiftPremiumsBox(
-		not_null<UserData*> user,
-		const QString &ref) {
-	_giftPremiumValidator.showChosenPeerBox(user, ref);
 }
 
 void SessionController::init() {
@@ -2443,9 +2438,9 @@ void SessionController::clearPassportForm() {
 
 void SessionController::showChooseReportMessages(
 		not_null<PeerData*> peer,
-		Ui::ReportReason reason,
-		Fn<void(MessageIdsList)> done) const {
-	content()->showChooseReportMessages(peer, reason, std::move(done));
+		Data::ReportInput reportInput,
+		Fn<void(std::vector<MsgId>)> done) const {
+	content()->showChooseReportMessages(peer, reportInput, std::move(done));
 }
 
 void SessionController::clearChooseReportMessages() const {

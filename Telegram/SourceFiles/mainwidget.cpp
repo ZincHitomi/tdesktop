@@ -43,6 +43,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "window/window_history_hider.h"
 #include "window/window_controller.h"
 #include "window/window_peer_menu.h"
+#include "window/window_session_controller_link_info.h"
 #include "window/themes/window_theme.h"
 #include "chat_helpers/bot_command.h"
 #include "chat_helpers/tabbed_selector.h" // TabbedSelector::refreshStickers
@@ -422,7 +423,7 @@ MainWidget::MainWidget(
 
 	cSetOtherOnline(0);
 
-	_history->start();
+	session().data().stickers().notifySavedGifsUpdated();
 }
 
 MainWidget::~MainWidget() = default;
@@ -743,14 +744,26 @@ void MainWidget::hideSingleUseKeyboard(FullMsgId replyToId) {
 	_history->hideSingleUseKeyboard(replyToId);
 }
 
-void MainWidget::searchMessages(const QString &query, Dialogs::Key inChat, PeerData *from) {
+void MainWidget::searchMessages(
+		const QString &query,
+		Dialogs::Key inChat,
+		PeerData *searchFrom) {
+	const auto complex = Data::HashtagWithUsernameFromQuery(query);
+	if (!complex.username.isEmpty()) {
+		_controller->showPeerByLink(Window::PeerByLinkInfo{
+			.usernameOrId = complex.username,
+			.text = complex.hashtag,
+			.resolveType = Window::ResolveType::HashtagSearch,
+		});
+		return;
+	}
 	auto tags = Data::SearchTagsFromQuery(query);
 	if (_dialogs) {
 		auto state = Dialogs::SearchState{
 			.inChat = ((tags.empty() || inChat.sublist())
 				? inChat
 				: session().data().history(session().user())),
-			.fromPeer = from ? from : nullptr,
+			.fromPeer = inChat ? searchFrom : nullptr,
 			.tags = tags,
 			.query = tags.empty() ? query : QString(),
 		};
@@ -770,12 +783,15 @@ void MainWidget::searchMessages(const QString &query, Dialogs::Key inChat, PeerD
 				controller()->session().user());
 		}
 		if ((!_mainSection
-			|| !_mainSection->searchInChatEmbedded(inChat, query))
-			&& !_history->searchInChatEmbedded(inChat, query)) {
+			|| !_mainSection->searchInChatEmbedded(query, inChat, searchFrom))
+			&& !_history->searchInChatEmbedded(query, inChat, searchFrom)) {
 			const auto account = not_null(&session().account());
 			if (const auto window = Core::App().windowFor(account)) {
 				if (const auto controller = window->sessionController()) {
-					controller->content()->searchMessages(query, inChat, nullptr);
+					controller->content()->searchMessages(
+						query,
+						inChat,
+						searchFrom);
 					controller->widget()->activate();
 				}
 			}
@@ -1219,9 +1235,9 @@ void MainWidget::setInnerFocus() {
 
 void MainWidget::showChooseReportMessages(
 		not_null<PeerData*> peer,
-		Ui::ReportReason reason,
-		Fn<void(MessageIdsList)> done) {
-	_history->setChooseReportMessagesDetails(reason, std::move(done));
+		Data::ReportInput reportInput,
+		Fn<void(std::vector<MsgId>)> done) {
+	_history->setChooseReportMessagesDetails(reportInput, std::move(done));
 	_controller->showPeerHistory(
 		peer,
 		SectionShow::Way::Forward,
@@ -1539,7 +1555,7 @@ void MainWidget::showForum(
 	_dialogs->showForum(forum, params);
 
 	if (params.activation != anim::activation::background) {
-		_controller->hideLayer();
+		_controller->window().hideSettingsAndLayer();
 	}
 }
 
