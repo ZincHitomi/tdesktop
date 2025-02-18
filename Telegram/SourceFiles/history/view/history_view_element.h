@@ -80,7 +80,8 @@ class ElementDelegate {
 public:
 	virtual Context elementContext() = 0;
 	virtual bool elementUnderCursor(not_null<const Element*> view) = 0;
-	virtual SelectionModeResult elementInSelectionMode() = 0;
+	virtual SelectionModeResult elementInSelectionMode(
+		const Element *view) = 0;
 	virtual bool elementIntersectsRange(
 		not_null<const Element*> view,
 		int from,
@@ -136,7 +137,7 @@ public:
 class DefaultElementDelegate : public ElementDelegate {
 public:
 	bool elementUnderCursor(not_null<const Element*> view) override;
-	SelectionModeResult elementInSelectionMode() override;
+	SelectionModeResult elementInSelectionMode(const Element *view) override;
 	bool elementIntersectsRange(
 		not_null<const Element*> view,
 		int from,
@@ -336,6 +337,8 @@ public:
 		not_null<HistoryItem*> data,
 		Element *replacing,
 		Flag serviceFlag);
+
+	[[nodiscard]] virtual bool embedReactionsInBubble() const;
 
 	[[nodiscard]] not_null<ElementDelegate*> delegate() const;
 	[[nodiscard]] not_null<HistoryItem*> data() const;
@@ -562,9 +565,9 @@ public:
 
 	[[nodiscard]] bool markSponsoredViewed(int shownFromTop) const;
 
-	virtual void animateReaction(Ui::ReactionFlyAnimationArgs &&args);
+	virtual void animateReaction(Ui::ReactionFlyAnimationArgs &&args) = 0;
 	void animateUnreadReactions();
-	[[nodiscard]] virtual auto takeReactionAnimations()
+	[[nodiscard]] auto takeReactionAnimations()
 	-> base::flat_map<
 		Data::ReactionId,
 		std::unique_ptr<Ui::ReactionFlyAnimation>>;
@@ -618,6 +621,12 @@ protected:
 	void clearSpecialOnlyEmoji();
 	void checkSpecialOnlyEmoji();
 
+	void setupReactions(Element *replacing);
+	void refreshReactions();
+	bool updateReactions();
+
+	std::unique_ptr<Reactions::InlineList> _reactions;
+
 private:
 	// This should be called only from previousInBlocksChanged()
 	// to add required bits to the Composer mask
@@ -642,6 +651,7 @@ private:
 	void setTextWithLinks(
 		const TextWithEntities &text,
 		const std::vector<ClickHandlerPtr> &links = {});
+	void setReactions(std::unique_ptr<Reactions::InlineList> list);
 
 	struct TextWithLinks {
 		TextWithEntities text;
@@ -668,5 +678,13 @@ private:
 	Context _context = Context();
 
 };
+
+[[nodiscard]] int FindViewY(
+	not_null<Element*> view,
+	uint16 symbol,
+	int yfrom = 0);
+
+[[nodiscard]] Window::SessionController *ExtractController(
+	const ClickContext &context);
 
 } // namespace HistoryView

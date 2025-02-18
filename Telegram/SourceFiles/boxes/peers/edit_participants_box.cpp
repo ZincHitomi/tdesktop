@@ -30,11 +30,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_changes.h"
 #include "base/unixtime.h"
 #include "ui/effects/outline_segments.h"
+#include "ui/widgets/menu/menu_multiline_action.h"
 #include "ui/widgets/popup_menu.h"
+#include "ui/text/text_utilities.h"
 #include "info/profile/info_profile_values.h"
 #include "window/window_session_controller.h"
 #include "history/history.h"
 #include "facades.h"
+#include "styles/style_chat.h"
 #include "styles/style_menu_icons.h"
 
 namespace {
@@ -645,7 +648,7 @@ PeerData *ParticipantsAdditionalData::applyParticipant(
 			&& overrideRole != Role::Members) {
 			return logBad();
 		}
-		return applyRegular(data.userId());
+		return applyRegular(data);
 	}
 	case Api::ChatParticipant::Type::Restricted:
 	case Api::ChatParticipant::Type::Banned:
@@ -664,7 +667,7 @@ PeerData *ParticipantsAdditionalData::applyParticipant(
 
 UserData *ParticipantsAdditionalData::applyCreator(
 		const Api::ChatParticipant &data) {
-	if (const auto user = applyRegular(data.userId())) {
+	if (const auto user = applyRegular(data)) {
 		_creator = user;
 		_adminRights[user] = data.rights();
 		if (user->isSelf()) {
@@ -727,14 +730,21 @@ UserData *ParticipantsAdditionalData::applyAdmin(
 	return user;
 }
 
-UserData *ParticipantsAdditionalData::applyRegular(UserId userId) {
-	const auto user = _peer->owner().userLoaded(userId);
+UserData *ParticipantsAdditionalData::applyRegular(const Api::ChatParticipant &data) {
+	const auto user = _peer->owner().userLoaded(data.userId());
 	if (!user) {
 		return nullptr;
 	} else if (const auto chat = _peer->asChat()) {
 		// This can come from saveAdmin or saveRestricted callback.
 		_admins.erase(user);
 		return user;
+	}
+
+	if (data.memberSince()) {
+		_memberSince[user] = data.memberSince();
+	}
+	else {
+		_memberSince.remove(user);
 	}
 
 	_infoNotLoaded.erase(user);
@@ -1646,6 +1656,72 @@ base::unique_qptr<Ui::PopupMenu> ParticipantsBoxController::rowContextMenu(
 	auto result = base::make_unique_q<Ui::PopupMenu>(
 		parent,
 		st::popupMenuWithIcons);
+	const auto addToEnd = gsl::finally([&] {
+		const auto addInfoAction = [&](
+				not_null<PeerData*> by,
+				tr::phrase<lngtag_user, lngtag_date> phrase,
+				TimeId since) {
+			auto text = phrase(
+				tr::now,
+				lt_user,
+				Ui::Text::Bold(by->name()),
+				lt_date,
+				Ui::Text::Bold(
+					langDateTimeFull(base::unixtime::parse(since))),
+				Ui::Text::WithEntities);
+			auto button = base::make_unique_q<Ui::Menu::MultilineAction>(
+				result->menu(),
+				result->st().menu,
+				st::historyHasCustomEmoji,
+				st::historyHasCustomEmojiPosition,
+				std::move(text));
+			if (const auto n = _navigation) {
+				button->setClickedCallback([=] {
+					n->parentController()->showPeerInfo(by);
+				});
+			}
+			result->addSeparator();
+			result->addAction(std::move(button));
+		};
+
+		const auto addJoinInfoAction = [&](
+				tr::phrase<lngtag_date> phrase,
+				TimeId since) {
+			auto text = phrase(
+				tr::now,
+				lt_date,
+				Ui::Text::Bold(
+				langDateTimeFull(base::unixtime::parse(since))),
+				Ui::Text::WithEntities);
+			auto button = base::make_unique_q<Ui::Menu::MultilineAction>(
+				result->menu(),
+				result->st().menu,
+				st::historyHasCustomEmoji,
+				st::historyHasCustomEmojiPosition,
+				std::move(text));
+			result->addSeparator();
+			result->addAction(std::move(button));
+		};
+
+		if (const auto by = _additional.restrictedBy(participant)) {
+			if (const auto since = _additional.restrictedSince(participant)) {
+				addInfoAction(
+					by,
+					_additional.isKicked(participant)
+						? tr::lng_rights_chat_banned_by
+						: tr::lng_rights_chat_restricted_by,
+					since);
+			}
+		} else if (user) {
+			if (const auto by = _additional.adminPromotedBy(user)) {
+				if (const auto since = _additional.adminPromotedSince(user)) {
+					addInfoAction(by, tr::lng_rights_about_by, since);
+				}
+			} else if (const auto since = _additional.memberSince(user)) {
+				addJoinInfoAction(tr::lng_group_invite_joined_status, since);
+			}
+		}
+	});
 	if (_navigation) {
 		result->addAction(
 			(participant->isUser()
@@ -1653,8 +1729,9 @@ base::unique_qptr<Ui::PopupMenu> ParticipantsBoxController::rowContextMenu(
 				: participant->isBroadcast()
 				? tr::lng_context_view_channel
 				: tr::lng_context_view_group)(tr::now),
-			crl::guard(this, [=] {
-				_navigation->showPeerInfo(participant); }),
+			crl::guard(this, [=, this] {
+				_navigation->parentController()->showPeerInfo(participant);
+			}),
 			(participant->isUser()
 				? &st::menuIconProfile
 				: &st::menuIconInfo));
@@ -1662,33 +1739,6 @@ base::unique_qptr<Ui::PopupMenu> ParticipantsBoxController::rowContextMenu(
 			tr::lng_context_show_messages_from(tr::now),
 			crl::guard(this, [=] { App::searchByHashtag(QString(), _peer, participant); }),
 			&st::menuIconInfo);
-	}
-	if (const auto by = _additional.restrictedBy(participant)) {
-		result->addAction(
-			(_role == Role::Kicked
-				? tr::lng_channel_banned_status_removed_by
-				: tr::lng_channel_banned_status_restricted_by)(
-					tr::now,
-					lt_user,
-					by->name()),
-			crl::guard(this, [=] {
-				_navigation->parentController()->show(
-					PrepareShortInfoBox(by, _navigation));
-			}),
-			&st::menuIconAdmin);
-	} else if (user) {
-		if (const auto by = _additional.adminPromotedBy(user)) {
-			result->addAction(
-				tr::lng_channel_admin_status_promoted_by(
-					tr::now,
-					lt_user,
-					by->name()),
-				crl::guard(this, [=] {
-					_navigation->parentController()->show(
-						PrepareShortInfoBox(by, _navigation));
-				}),
-				&st::menuIconAdmin);
-		}
 	}
 	if (_role == Role::Kicked) {
 		if (_peer->isMegagroup()
@@ -2268,6 +2318,8 @@ void ParticipantsBoxSearchController::restoreState(
 		_allLoaded = my->allLoaded;
 		_offset = my->offset;
 		_query = my->query;
+		_timer.cancel();
+		_requestId = 0;
 		if (my->wasLoading) {
 			searchOnServer();
 		}

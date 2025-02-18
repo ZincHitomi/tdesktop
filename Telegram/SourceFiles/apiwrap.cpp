@@ -569,6 +569,14 @@ void ApiWrap::sendMessageFail(
 			: tr::lng_error_noforwards_group(tr::now), kJoinErrorDuration);
 	} else if (error == u"PREMIUM_ACCOUNT_REQUIRED"_q) {
 		Settings::ShowPremium(&session(), "premium_stickers");
+	} else if (error == u"SCHEDULE_TOO_MUCH"_q) {
+		auto &scheduled = _session->scheduledMessages();
+		if (const auto item = scheduled.lookupItem(peer->id, itemId.msg)) {
+			scheduled.removeSending(item);
+		}
+		if (show) {
+			show->showToast(tr::lng_error_schedule_limit(tr::now));
+		}
 	}
 	if (const auto item = _session->data().message(itemId)) {
 		Assert(randomId != 0);
@@ -713,6 +721,32 @@ void ApiWrap::finalizeMessageDataRequest(
 	}
 	for (const auto &callback : callbacks) {
 		callback();
+	}
+}
+
+void ApiWrap::exportMessageAsBase64(not_null<HistoryItem*> item, Fn<void(const QString&)> done, Fn<void()> fail) {
+	auto ids = QVector<MTPInputMessage>{ MTP_inputMessageID(MTP_int(item->id)) };
+	auto requestDone = [=](
+		const MTPmessages_Messages& result,
+		const MTP::Response& response) {
+			auto buffer = response.reply;
+			QByteArray byteArray(reinterpret_cast<const char*>(buffer.data()), buffer.size() * sizeof(mtpPrime));
+			QString base64String = byteArray.toBase64(QByteArray::Base64UrlEncoding);
+			done(base64String);
+		};
+	if (item->history()->peer->isChannel()) {
+		request(MTPchannels_GetMessages(
+			item->history()->peer->asChannel()->inputChannel,
+			MTP_vector<MTPInputMessage>(ids)
+		)).done(requestDone).fail([=](const MTP::Error& error, mtpRequestId requestId) {
+			fail();
+		}).send();
+	} else {
+		request(MTPmessages_GetMessages(
+			MTP_vector<MTPInputMessage>(ids)
+		)).done(requestDone).fail([=](const MTP::Error& error, mtpRequestId requestId) {
+			fail();
+		}).send();
 	}
 }
 
@@ -3221,6 +3255,31 @@ void ApiWrap::sharedMediaDone(
 	}
 }
 
+mtpRequestId ApiWrap::requestGlobalMedia(
+		Storage::SharedMediaType type,
+		const QString &query,
+		int32 offsetRate,
+		Data::MessagePosition offsetPosition,
+		Fn<void(Api::GlobalMediaResult)> done) {
+	auto prepared = Api::PrepareGlobalMediaRequest(
+		_session,
+		offsetRate,
+		offsetPosition,
+		type,
+		query);
+	if (!prepared) {
+		done({});
+		return 0;
+	}
+	return request(
+		std::move(*prepared)
+	).done([=](const Api::SearchRequestResult &result) {
+		done(Api::ParseGlobalMediaResult(_session, result));
+	}).fail([=] {
+		done({});
+	}).send();
+}
+
 void ApiWrap::sendAction(const SendAction &action) {
 	if (!action.options.scheduled
 		&& !action.options.shortcutId
@@ -3244,13 +3303,13 @@ void ApiWrap::finishForwarding(const SendAction &action) {
 	const auto topicRootId = action.replyTo.topicRootId;
 	auto toForward = history->resolveForwardDraft(topicRootId);
 	if (!toForward.items.empty()) {
-		const auto error = GetErrorTextForSending(
+		const auto error = GetErrorForSending(
 			history->peer,
 			{
 				.topicRootId = topicRootId,
 				.forward = &toForward.items,
 			});
-		if (!error.isEmpty()) {
+		if (error) {
 			return;
 		}
 
@@ -3957,7 +4016,8 @@ void ApiWrap::sendInlineResult(
 		not_null<UserData*> bot,
 		not_null<InlineBots::Result*> data,
 		const SendAction &action,
-		std::optional<MsgId> localMessageId) {
+		std::optional<MsgId> localMessageId,
+		Fn<void(bool)> done) {
 	sendAction(action);
 
 	const auto history = action.history;
@@ -4037,11 +4097,17 @@ void ApiWrap::sendInlineResult(
 		history->finishSavingCloudDraft(
 			topicRootId,
 			UnixtimeFromMsgId(response.outerMsgId));
+		if (done) {
+			done(true);
+		}
 	}, [=](const MTP::Error &error, const MTP::Response &response) {
 		sendMessageFail(error, peer, randomId, newId);
 		history->finishSavingCloudDraft(
 			topicRootId,
 			UnixtimeFromMsgId(response.outerMsgId));
+		if (done) {
+			done(false);
+		}
 	});
 	finishForwarding(action);
 }
